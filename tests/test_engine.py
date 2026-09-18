@@ -21,6 +21,7 @@ from app.comparison import (  # noqa: E402
     impact_analysis,
 )
 from app.evaluator import FlagEvaluator, evaluate_flag, hash_bucket  # noqa: E402
+from app.preview import _json_equal, build_evaluation_preview  # noqa: E402
 from app.validation import ConfigValidationError, validate_config  # noqa: E402
 
 
@@ -755,6 +756,230 @@ class VersionComparisonTests(unittest.TestCase):
     def test_impacts_sorted_by_changed_flag_name(self):
         result = compare_versions({}, {"zeta": flag(), "alpha": flag()})
         self.assertEqual([i["flag"] for i in result["impacts"]], ["alpha", "zeta"])
+
+
+class EvaluationPreviewTests(unittest.TestCase):
+    """Per-subject decision diffs between two pinned config versions."""
+
+    def subject(self, subject_id, user_id=None, **attributes):
+        return {
+            "subject_id": subject_id,
+            "user_id": user_id,
+            "attributes": attributes,
+        }
+
+    def test_value_change_reports_both_sides(self):
+        from_config = {"flags": {"f": flag(default="old", rules=[])}}
+        to_config = {"flags": {"f": flag(default="new", rules=[])}}
+        preview = build_evaluation_preview(
+            from_config, to_config, ["f"], [self.subject("s1")]
+        )
+        self.assertEqual(
+            preview["changed"],
+            [
+                {
+                    "subject_id": "s1",
+                    "flag": "f",
+                    "from": {
+                        "exists": True,
+                        "value": "old",
+                        "reason": "default",
+                        "rule_id": None,
+                    },
+                    "to": {
+                        "exists": True,
+                        "value": "new",
+                        "reason": "default",
+                        "rule_id": None,
+                    },
+                }
+            ],
+        )
+        self.assertEqual(
+            preview["summary"], [{"flag": "f", "changed": 1, "unchanged": 0}]
+        )
+
+    def test_reason_and_rule_id_differences_alone_are_unchanged(self):
+        # Same value, different explanation: rule_match/r1 vs plain default.
+        from_config = {
+            "flags": {
+                "f": flag(
+                    default=False,
+                    rules=[rule([{"attr": "x", "op": "eq", "value": 1}], value=False, id="r1")],
+                )
+            }
+        }
+        to_config = {"flags": {"f": flag(default=False, rules=[])}}
+        preview = build_evaluation_preview(
+            from_config, to_config, ["f"], [self.subject("s1", x=1)]
+        )
+        self.assertEqual(preview["changed"], [])
+        self.assertEqual(
+            preview["summary"], [{"flag": "f", "changed": 0, "unchanged": 1}]
+        )
+
+    def test_json_type_difference_counts_as_changed(self):
+        # true (boolean) vs 1 (number): equal under ==, different JSON types.
+        from_config = {"flags": {"f": flag(default=True)}}
+        to_config = {"flags": {"f": flag(default=1)}}
+        preview = build_evaluation_preview(
+            from_config, to_config, ["f"], [self.subject("s1")]
+        )
+        self.assertEqual(len(preview["changed"]), 1)
+        self.assertEqual(preview["changed"][0]["from"]["value"], True)
+        self.assertEqual(preview["changed"][0]["to"]["value"], 1)
+
+    def test_nested_json_type_difference_counts_as_changed(self):
+        self.assertFalse(_json_equal([1, True], [1, 1]))
+        self.assertFalse(_json_equal({"a": True}, {"a": 1}))
+        self.assertTrue(_json_equal({"a": [1, "x"]}, {"a": [1, "x"]}))
+        self.assertTrue(_json_equal(1, 1.0))  # both JSON numbers
+        self.assertFalse(_json_equal({"a": 1}, {"a": 1, "b": 2}))
+
+    def test_existence_difference_is_changed(self):
+        from_config = {"flags": {"f": flag(default="v1")}}
+        to_config = {"flags": {}}
+        preview = build_evaluation_preview(
+            from_config, to_config, ["f"], [self.subject("s1")]
+        )
+        self.assertEqual(len(preview["changed"]), 1)
+        entry = preview["changed"][0]
+        self.assertEqual(
+            entry["from"],
+            {"exists": True, "value": "v1", "reason": "default", "rule_id": None},
+        )
+        self.assertEqual(
+            entry["to"],
+            {"exists": False, "value": None, "reason": None, "rule_id": None},
+        )
+
+    def test_missing_in_both_versions_is_unchanged(self):
+        preview = build_evaluation_preview(
+            {"flags": {}}, {"flags": {}}, ["ghost"], [self.subject("s1")]
+        )
+        self.assertEqual(preview["changed"], [])
+        self.assertEqual(
+            preview["summary"], [{"flag": "ghost", "changed": 0, "unchanged": 1}]
+        )
+
+    def test_changed_entries_follow_request_order(self):
+        # Subjects drive the outer order, flags the inner order — not sorted.
+        from_config = {"flags": {"b": flag(default=1), "a": flag(default=1)}}
+        to_config = {"flags": {"b": flag(default=2), "a": flag(default=2)}}
+        subjects = [self.subject("z-subject"), self.subject("a-subject")]
+        preview = build_evaluation_preview(
+            from_config, to_config, ["b", "a"], subjects
+        )
+        order = [(c["subject_id"], c["flag"]) for c in preview["changed"]]
+        self.assertEqual(
+            order,
+            [
+                ("z-subject", "b"),
+                ("z-subject", "a"),
+                ("a-subject", "b"),
+                ("a-subject", "a"),
+            ],
+        )
+        self.assertEqual(
+            preview["summary"],
+            [
+                {"flag": "b", "changed": 2, "unchanged": 0},
+                {"flag": "a", "changed": 2, "unchanged": 0},
+            ],
+        )
+
+    def test_summary_aggregates_per_flag_in_request_order(self):
+        from_config = {"flags": {"x": flag(default=1), "y": flag(default=1)}}
+        to_config = {"flags": {"x": flag(default=2), "y": flag(default=1)}}
+        subjects = [self.subject("s1"), self.subject("s2"), self.subject("s3")]
+        preview = build_evaluation_preview(
+            from_config, to_config, ["y", "x"], subjects
+        )
+        self.assertEqual(
+            preview["summary"],
+            [
+                {"flag": "y", "changed": 0, "unchanged": 3},
+                {"flag": "x", "changed": 3, "unchanged": 0},
+            ],
+        )
+
+    def test_rollout_change_uses_each_subjects_user_id(self):
+        from_config = {
+            "flags": {"f": flag(rollout={"percentage": 0, "key": "user_id", "value": True})}
+        }
+        to_config = {
+            "flags": {"f": flag(rollout={"percentage": 100, "key": "user_id", "value": True})}
+        }
+        subjects = [self.subject(f"s{i}", user_id=f"user-{i}") for i in range(5)]
+        preview = build_evaluation_preview(from_config, to_config, ["f"], subjects)
+        # 0% -> always the default (False); 100% -> always the rollout value.
+        self.assertEqual(len(preview["changed"]), 5)
+        for entry in preview["changed"]:
+            self.assertEqual(entry["from"]["value"], False)
+            self.assertEqual(entry["from"]["reason"], "rollout_out")
+            self.assertEqual(entry["to"]["value"], True)
+            self.assertEqual(entry["to"]["reason"], "rollout_in")
+
+    def test_segment_memo_shared_within_subject_but_not_across_subjects(self):
+        # Two flags referencing one segment, two subjects, two versions:
+        # the segment's single condition must run exactly once per
+        # (version, subject) pair — 1 * 2 * 2 = 4 comparisons.
+        segments = {
+            "staff": {
+                "conditions": [{"attr": "email", "op": "suffix", "value": "@acme.com"}]
+            }
+        }
+        flags = {
+            "a": flag(rules=[rule([{"op": "segment", "value": "staff"}], id="ra")]),
+            "b": flag(rules=[rule([{"op": "segment", "value": "staff"}], id="rb")]),
+        }
+        config = {"segments": segments, "flags": flags}
+        subjects = [
+            self.subject("staff", email="ada@acme.com"),
+            self.subject("other", email="bob@example.com"),
+        ]
+        with mock.patch.object(
+            evaluator_mod, "_compare", wraps=evaluator_mod._compare
+        ) as spy:
+            preview = build_evaluation_preview(config, config, ["a", "b"], subjects)
+        self.assertEqual(spy.call_count, 4)
+        # Same version on both sides -> nothing changed, but per-subject
+        # audience decisions were computed independently.
+        self.assertEqual(preview["changed"], [])
+        self.assertEqual(
+            preview["summary"],
+            [
+                {"flag": "a", "changed": 0, "unchanged": 2},
+                {"flag": "b", "changed": 0, "unchanged": 2},
+            ],
+        )
+
+    def test_subjects_do_not_share_segment_decisions(self):
+        # A cached cross-subject memo would leak "staff" from s1 into s2.
+        segments = {
+            "staff": {
+                "conditions": [{"attr": "email", "op": "suffix", "value": "@acme.com"}]
+            }
+        }
+        from_config = {
+            "segments": segments,
+            "flags": {"f": flag(rules=[rule([{"op": "segment", "value": "staff"}])])},
+        }
+        to_config = {
+            "segments": segments,
+            "flags": {"f": flag(default=False, rules=[])},
+        }
+        subjects = [
+            self.subject("s1", email="ada@acme.com"),
+            self.subject("s2", email="bob@example.com"),
+        ]
+        preview = build_evaluation_preview(from_config, to_config, ["f"], subjects)
+        # s1 matched the segment in the from version (True -> False: changed);
+        # s2 did not (False -> False: unchanged).
+        self.assertEqual([c["subject_id"] for c in preview["changed"]], ["s1"])
+        self.assertEqual(
+            preview["summary"], [{"flag": "f", "changed": 1, "unchanged": 1}]
+        )
 
 
 class ImmutableVersionStorageTests(unittest.TestCase):

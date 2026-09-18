@@ -159,6 +159,71 @@ class ErrorDetail(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Evaluation preview models
+# ---------------------------------------------------------------------------
+
+MAX_PREVIEW_SUBJECTS = 200
+MAX_PREVIEW_FLAGS = 50
+
+
+class PreviewSubject(StrictModel):
+    """One subject sample: a unique id plus the usual evaluation context."""
+
+    subject_id: str = Field(min_length=1)
+    user_id: Optional[Any] = None
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvaluationPreviewRequest(StrictModel):
+    from_version: str = Field(min_length=1)
+    to_version: str = Field(min_length=1)
+    flags: list[str] = Field(min_length=1, max_length=MAX_PREVIEW_FLAGS)
+    subjects: list[PreviewSubject] = Field(
+        min_length=1, max_length=MAX_PREVIEW_SUBJECTS
+    )
+
+    @model_validator(mode="after")
+    def _subject_ids_unique(self) -> "EvaluationPreviewRequest":
+        seen: set[str] = set()
+        for subject in self.subjects:
+            if subject.subject_id in seen:
+                raise ValueError(f"duplicate subject_id {subject.subject_id!r}")
+            seen.add(subject.subject_id)
+        return self
+
+
+class PreviewSide(BaseModel):
+    """One version's decision for a (subject, flag) pair."""
+
+    exists: bool
+    value: Any = None
+    reason: Optional[str] = None
+    rule_id: Optional[str] = None
+
+
+class PreviewChange(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    subject_id: str
+    flag: str
+    from_: PreviewSide = Field(alias="from")
+    to: PreviewSide
+
+
+class PreviewFlagSummary(BaseModel):
+    flag: str
+    changed: int
+    unchanged: int
+
+
+class EvaluationPreviewResponse(BaseModel):
+    from_version: str
+    to_version: str
+    changed: list[PreviewChange]
+    summary: list[PreviewFlagSummary]
+
+
+# ---------------------------------------------------------------------------
 # Evaluation request models
 # ---------------------------------------------------------------------------
 

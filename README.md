@@ -10,6 +10,7 @@
 - 📋 **有序规则**：`rules` 按顺序匹配、首条命中即返回，支持 `eq/ne/in/nin/gt/ge/lt/le/prefix/suffix` 及分组引用 `segment`。
 - 🎯 **稳定百分比分流**：`sha1(flag_key:user_id) % 100`，同一用户在同一开关上桶位恒定，放量单调扩大；不同开关独立分布。
 - 🔀 **版本影响分析**：对比任意两个已发布版本，给出开关级 `added/removed/modified` 差异，并沿两版本前置依赖边的并集反向传播，列出每个变化开关间接影响的上游开关及一条最短路径。
+- 🔬 **评估预览**：发布前用两个已发布版本对一批样本（唯一 `subject_id` + `user_id` + `attributes`）逐一计算“样本 × 开关”的判定差异；**存在性或 `value` 的 JSON 类型/值不同才算 changed**，仅 `reason`/`rule_id` 不同不算；changed 明细按请求排序并回显双方的 `exists`/`value`/`reason`/`rule_id`，另按开关汇总 changed/unchanged；每个“版本 × 样本”使用独立判定器，分组缓存绝不跨样本复用。
 - 🌍 **环境指针 + 乐观并发**：`production`/`staging` 等环境是指向已发布版本的**指针**，带单调递增的 `revision`。创建只接受 `expected_revision=0`（初始 revision 为 1），更新须凭当前 revision 换号；同一 `BEGIN IMMEDIATE` 事务内完成校验、版本存在性确认与 revision 加一，竞争或过期写入得到 `409 stale_revision` 且指针不变。环境级判定单次请求使用同一指针快照，响应回显 `version` 与 `revision`。
 - 🚫 **发布时强校验**：循环依赖（含自依赖）、悬挂依赖、非法比例（非整数或越界）、未知操作符、重复规则 ID、悬空分组引用与分组循环一律拒绝。
 - 🧪 **纯函数引擎**：判定引擎与校验器零第三方依赖，可直接用系统 Python 跑单测。
@@ -252,6 +253,56 @@ curl -s -X POST http://localhost:8000/api/v1/configs \
   -H 'Content-Type: application/json' --data @examples/invalid_segment_cycle.json
 ```
 
+### 10. 评估预览（两版本 × 样本 × 开关）
+
+发布前想确认“新版本会改变哪些用户的判定结果”？`POST /api/v1/evaluation-previews` 用**两个已发布版本**对一批样本逐一计算 `样本 × 开关` 的判定，只报告**值层面**的差异：
+
+```bash
+# 对比 2026-09-17 → 2026-09-18（即示例中的 v1 → v2）
+curl -s -X POST http://localhost:8000/api/v1/evaluation-previews \
+  -H 'Content-Type: application/json' --data @examples/preview_request.json
+```
+
+请求体含 `from_version`、`to_version`、`flags`（≤ 50）、`subjects`（≤ 200）；每个样本含**唯一** `subject_id`、可选 `user_id` 与 `attributes`。响应：
+
+```json
+{
+  "from_version": "2026-09-17",
+  "to_version": "2026-09-18",
+  "changed": [
+    {
+      "subject_id": "s-ada",
+      "flag": "dark_mode",
+      "from": { "exists": true, "value": "system", "reason": "rollout_out", "rule_id": null },
+      "to": { "exists": false, "value": null, "reason": null, "rule_id": null }
+    },
+    {
+      "subject_id": "s-bob",
+      "flag": "new_checkout",
+      "from": { "exists": true, "value": false, "reason": "rollout_out", "rule_id": null },
+      "to": { "exists": true, "value": true, "reason": "rollout_in", "rule_id": null }
+    },
+    {
+      "subject_id": "s-bob",
+      "flag": "dark_mode",
+      "from": { "exists": true, "value": "light", "reason": "rule_match", "rule_id": "forced-light" },
+      "to": { "exists": false, "value": null, "reason": null, "rule_id": null }
+    }
+  ],
+  "summary": [
+    { "flag": "new_checkout", "changed": 1, "unchanged": 1 },
+    { "flag": "dark_mode", "changed": 2, "unchanged": 0 }
+  ]
+}
+```
+
+判定规则：
+
+- **changed 的判定**：开关只在一个版本存在（`exists` 不同），或双方 `value` 的 JSON 类型/值不同（结构化比较，布尔 `true` 不等于数字 `1`）；仅 `reason`/`rule_id` 不同**不算** changed——上例 `s-ada` 的 `new_checkout` 从 `rule_match` 变为 `rollout_in`，但值都是 `true`，因此未出现在明细中；
+- **changed 明细**按请求顺序排列（先样本、后开关），每条含 `subject_id`、`flag` 和双方各自的 `exists`/`value`/`reason`/`rule_id`（不存在的一侧三者均为 `null`）；`summary` 按开关汇总 changed/unchanged 数，顺序为开关在请求中首次出现的顺序；
+- **判定器作用域**：每个“版本 × 样本”使用独立判定器——同一样本的多个开关共享分组（segment）计算结果，但分组缓存**绝不跨样本复用**；
+- **错误**：`subject_id` 重复、`subjects` 超过 200 或 `flags` 超过 50 → `422 invalid_request`；任一版本不存在 → `404 version_not_found`（先确认两个版本都存在再开始计算，不会返回部分结果）。
+
 ### 非法配置会被拒绝
 
 ```bash
@@ -341,6 +392,7 @@ curl -s -X POST http://localhost:8000/api/v1/configs \
 | `GET` | `/api/v1/configs` | 列出所有版本 |
 | `GET` | `/api/v1/configs/{version}` | 获取某版本完整配置（不存在返回 404） |
 | `POST` | `/api/v1/config-comparisons` | 版本影响分析，请求体 `{from_version, to_version}`，返回开关差异与反向依赖影响（任一版本不存在返回 404） |
+| `POST` | `/api/v1/evaluation-previews` | 评估预览，请求体 `{from_version, to_version, flags[]≤50, subjects[]≤200}`（`subject_id` 唯一）；按“样本 × 开关”对比两版本判定，返回按请求排序的 changed 明细（含双方 `exists`/`value`/`reason`/`rule_id`）与按开关的 changed/unchanged 汇总；版本不存在返回 404 且无部分结果 |
 | `PUT` | `/api/v1/environments/{name}` | 创建/移动环境指针，请求体 `{version, expected_revision}`；新建仅接受 `expected_revision=0`（201，revision 从 1 起），更新成功 revision 加一（200）；竞争/过期返回 409 `stale_revision`，版本不存在返回 404 `version_not_found` |
 | `GET` | `/api/v1/environments/{name}` | 读取环境指针，返回 `{name, version, revision, created_at, updated_at}`（环境不存在返回 404 `environment_not_found`） |
 | `POST` | `/api/v1/environments/{name}/evaluate` | 面向环境的批量判定，请求体 `{flags[], user_id?, attributes?}`，响应回显指针 `version`/`revision`，单次请求使用同一指针快照（环境不存在返回 404） |
@@ -367,7 +419,7 @@ FLAG_DB_PATH=data/flags.db uvicorn app.main:app --reload --port 8000
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、受众分组的嵌套引用/AND 语义/不匹配落默认/请求内结果复用/悬空引用与循环的防御性求值、分组发布校验（悬空引用、非法引用值、直接与间接循环、分组内未知操作符、错误可定位到分组或规则条件）、SQLite 版本不可变与历史保留、分组定义随版本存储与回显、固定版本重复判定稳定性、版本差异对比与影响传播（边并集、最短路径、字典序平局、并集成环、重复去重）、环境指针的创建/更新/revision 自增/过期写入/版本不存在/409 优先于 404/指针快照一致性，以及多线程并发更新下“每个 revision 恰有一个胜者、无丢失更新”。
+测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、受众分组的嵌套引用/AND 语义/不匹配落默认/请求内结果复用/悬空引用与循环的防御性求值、分组发布校验（悬空引用、非法引用值、直接与间接循环、分组内未知操作符、错误可定位到分组或规则条件）、SQLite 版本不可变与历史保留、分组定义随版本存储与回显、固定版本重复判定稳定性、版本差异对比与影响传播（边并集、最短路径、字典序平局、并集成环、重复去重）、评估预览（值变化回显双方明细、reason/rule_id 差异忽略、JSON 类型敏感的结构化比较、存在性差异、双版本均缺失、明细按请求排序、按开关汇总、分流按各样本 user_id 计算、分组缓存在“版本 × 样本”内共享且不跨样本复用）、环境指针的创建/更新/revision 自增/过期写入/版本不存在/409 优先于 404/指针快照一致性，以及多线程并发更新下“每个 revision 恰有一个胜者、无丢失更新”。
 
 ## 项目结构
 
@@ -379,8 +431,9 @@ app/
   validation.py  发布时语义校验（循环依赖/比例/操作符/分组引用与分组循环）
   evaluator.py   纯函数判定引擎（前置、分组递归求值与请求内复用、规则、稳定哈希分流）
   comparison.py  版本对比与反向依赖影响分析（纯函数）
+  preview.py     评估预览：两版本 × 样本 × 开关的判定差异（纯函数，分组缓存不跨样本）
 tests/           标准库 unittest 测试
-examples/        发布/判定/受众分组/版本对比/环境指针/非法配置示例
+examples/        发布/判定/受众分组/版本对比/评估预览/环境指针/非法配置示例
 Dockerfile, docker-compose.yml
 ```
 
