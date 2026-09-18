@@ -10,6 +10,7 @@
 - 📋 **有序规则**：`rules` 按顺序匹配、首条命中即返回，支持 `eq/ne/in/nin/gt/ge/lt/le/prefix/suffix` 及分组引用 `segment`。
 - 🎯 **稳定百分比分流**：`sha1(flag_key:user_id) % 100`，同一用户在同一开关上桶位恒定，放量单调扩大；不同开关独立分布。
 - 🔀 **版本影响分析**：对比任意两个已发布版本，给出开关级 `added/removed/modified` 差异，并沿两版本前置依赖边的并集反向传播，列出每个变化开关间接影响的上游开关及一条最短路径。
+- 🔮 **双版本判定预览**：用一组带唯一 `subject_id` 的样本（`user_id` + `attributes`）同时在两个版本上判定同一批开关；`exists` 或 `value` 的 JSON 类型/值不同才算 changed（仅 `reason`/`rule_id` 不同仍为 unchanged），明细按请求顺序给出双方完整判定、并按开关汇总 changed/unchanged；每个“版本×样本”共用判定器但分组缓存不跨样本复用。
 - 🌍 **环境指针 + 乐观并发**：`production`/`staging` 等环境是指向已发布版本的**指针**，带单调递增的 `revision`。创建只接受 `expected_revision=0`（初始 revision 为 1），更新须凭当前 revision 换号；同一 `BEGIN IMMEDIATE` 事务内完成校验、版本存在性确认与 revision 加一，竞争或过期写入得到 `409 stale_revision` 且指针不变。环境级判定单次请求使用同一指针快照，响应回显 `version` 与 `revision`。
 - 🚫 **发布时强校验**：循环依赖（含自依赖）、悬挂依赖、非法比例（非整数或越界）、未知操作符、重复规则 ID、悬空分组引用与分组循环一律拒绝。
 - 🧪 **纯函数引擎**：判定引擎与校验器零第三方依赖，可直接用系统 Python 跑单测。
@@ -252,6 +253,71 @@ curl -s -X POST http://localhost:8000/api/v1/configs \
   -H 'Content-Type: application/json' --data @examples/invalid_segment_cycle.json
 ```
 
+### 10. 双版本判定预览（样本 × 开关差异矩阵）
+
+发布两个版本后，可以用一组**样本**同时在两个版本上判定同一批开关，直接得到“这个版本灰度/改规则后，哪些人在哪些开关上的结果会变”：
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/evaluation-previews \
+  -H 'Content-Type: application/json' --data @examples/evaluation_preview_request.json
+```
+
+请求体（`examples/evaluation_preview_request.json`，对比 `2026-09-17 → 2026-09-18`）：
+
+```json
+{
+  "from_version": "2026-09-17",
+  "to_version": "2026-09-18",
+  "flags": ["new_checkout", "dark_mode", "legacy_button"],
+  "subjects": [
+    { "subject_id": "user-1", "user_id": "user-1",
+      "attributes": { "email": "ada@acme.com", "tier": "silver", "theme": "auto" } },
+    { "subject_id": "user-2", "user_id": "user-2",
+      "attributes": { "email": "bob@other.com", "tier": "free", "theme": "dark" } }
+  ]
+}
+```
+
+每个样本必须有唯一的 `subject_id`（结果中只回显它，不回显整份 attributes），`user_id` 驱动稳定百分比分流（attributes 未自带 `user_id` 时自动注入），`attributes` 是该样本的属性集合。响应：
+
+```json
+{
+  "from_version": "2026-09-17",
+  "to_version": "2026-09-18",
+  "changed": [
+    { "subject_id": "user-1", "flag": "dark_mode",
+      "from": { "exists": true, "value": "system", "reason": "rollout_out", "rule_id": null },
+      "to":   { "exists": false, "value": null, "reason": "flag_not_found", "rule_id": null } },
+    { "subject_id": "user-1", "flag": "legacy_button",
+      "from": { "exists": true, "value": false, "reason": "disabled", "rule_id": null },
+      "to":   { "exists": false, "value": null, "reason": "flag_not_found", "rule_id": null } },
+    { "subject_id": "user-2", "flag": "new_checkout",
+      "from": { "exists": true, "value": false, "reason": "rollout_out", "rule_id": null },
+      "to":   { "exists": true, "value": true, "reason": "rollout_in", "rule_id": null } },
+    { "subject_id": "user-2", "flag": "dark_mode",
+      "from": { "exists": true, "value": "dark", "reason": "rule_match", "rule_id": "forced-dark" },
+      "to":   { "exists": false, "value": null, "reason": "flag_not_found", "rule_id": null } },
+    { "subject_id": "user-2", "flag": "legacy_button",
+      "from": { "exists": true, "value": false, "reason": "disabled", "rule_id": null },
+      "to":   { "exists": false, "value": null, "reason": "flag_not_found", "rule_id": null } }
+  ],
+  "summary": [
+    { "flag": "new_checkout", "changed": 1, "unchanged": 1 },
+    { "flag": "dark_mode", "changed": 2, "unchanged": 0 },
+    { "flag": "legacy_button", "changed": 2, "unchanged": 0 }
+  ]
+}
+```
+
+变化判定与排序规则：
+
+- **changed**：两版本的 `exists` 不同（开关在其中一个版本不存在，缺失侧为 `exists=false`、`value=null`、`reason=flag_not_found`），或双方都存在但 `value` 的 **JSON 类型或值**不同（如整数 `1` 与布尔 `true`、字符串 `"1"` 与整数 `1` 均算变化）；
+- **unchanged**：`exists` 与 `value` 相同即算不变——即使 `reason`/`rule_id` 不同（例如规则换了编号、默认值变成兜底规则但交付的值不变）也**不算变化**，不出现在 `changed` 中；
+- `changed` 明细严格按**请求顺序**排列（样本在外、开关在内），每条含 `subject_id`、`flag` 以及双方的 `exists`/`value`/`reason`/`rule_id`；
+- `summary` 按请求中的 `flags` 顺序逐开关汇总 `changed`/`unchanged` 样本数；开关在两版本都不存在时该格记为 unchanged；`flags` 允许重复（每个请求位置独立计数）；
+- **判定器作用域**：同一个“版本 × 样本”只构建一个判定器，该样本在该版本的多个开关共享受众分组计算；但分组结果随样本属性变化，因此**判定器（及其分组缓存）绝不跨样本复用**——每个样本都为两个版本各取一个全新判定器；
+- `subject_id` 重复（`422 invalid_request`，错误类型 `duplicate_subject_id`）、样本超过 **200** 个、开关超过 **50** 个均返回 `422`；任一版本不存在返回 `404 version_not_found` 且**不产生任何部分结果**（请求体校验先于版本查询，故非法请求即使版本缺失仍是 422）。
+
 ### 非法配置会被拒绝
 
 ```bash
@@ -341,6 +407,7 @@ curl -s -X POST http://localhost:8000/api/v1/configs \
 | `GET` | `/api/v1/configs` | 列出所有版本 |
 | `GET` | `/api/v1/configs/{version}` | 获取某版本完整配置（不存在返回 404） |
 | `POST` | `/api/v1/config-comparisons` | 版本影响分析，请求体 `{from_version, to_version}`，返回开关差异与反向依赖影响（任一版本不存在返回 404） |
+| `POST` | `/api/v1/evaluation-previews` | 双版本判定预览，请求体 `{from_version, to_version, flags[], subjects[{subject_id, user_id?, attributes?}]}`；逐“样本×开关”对比两版本判定，`exists` 或 `value` 类型/值不同为 changed（仅 `reason`/`rule_id` 不同仍为 unchanged），按请求顺序输出明细并按开关汇总；重复 subject_id、样本 >200、开关 >50 返回 422，版本不存在返回 404 |
 | `PUT` | `/api/v1/environments/{name}` | 创建/移动环境指针，请求体 `{version, expected_revision}`；新建仅接受 `expected_revision=0`（201，revision 从 1 起），更新成功 revision 加一（200）；竞争/过期返回 409 `stale_revision`，版本不存在返回 404 `version_not_found` |
 | `GET` | `/api/v1/environments/{name}` | 读取环境指针，返回 `{name, version, revision, created_at, updated_at}`（环境不存在返回 404 `environment_not_found`） |
 | `POST` | `/api/v1/environments/{name}/evaluate` | 面向环境的批量判定，请求体 `{flags[], user_id?, attributes?}`，响应回显指针 `version`/`revision`，单次请求使用同一指针快照（环境不存在返回 404） |
@@ -367,7 +434,7 @@ FLAG_DB_PATH=data/flags.db uvicorn app.main:app --reload --port 8000
 python3 -m unittest discover -s tests -v
 ```
 
-测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、受众分组的嵌套引用/AND 语义/不匹配落默认/请求内结果复用/悬空引用与循环的防御性求值、分组发布校验（悬空引用、非法引用值、直接与间接循环、分组内未知操作符、错误可定位到分组或规则条件）、SQLite 版本不可变与历史保留、分组定义随版本存储与回显、固定版本重复判定稳定性、版本差异对比与影响传播（边并集、最短路径、字典序平局、并集成环、重复去重）、环境指针的创建/更新/revision 自增/过期写入/版本不存在/409 优先于 404/指针快照一致性，以及多线程并发更新下“每个 revision 恰有一个胜者、无丢失更新”。
+测试覆盖：有序规则与短路前置、依赖链顺序、禁用开关、哈希桶稳定性/单调性/边界（0 与 100）、二/三节点循环与自依赖拒绝、非法比例与未知操作符拒绝、受众分组的嵌套引用/AND 语义/不匹配落默认/请求内结果复用/悬空引用与循环的防御性求值、分组发布校验（悬空引用、非法引用值、直接与间接循环、分组内未知操作符、错误可定位到分组或规则条件）、SQLite 版本不可变与历史保留、分组定义随版本存储与回显、固定版本重复判定稳定性、版本差异对比与影响传播（边并集、最短路径、字典序平局、并集成环、重复去重）、环境指针的创建/更新/revision 自增/过期写入/版本不存在/409 优先于 404/指针快照一致性，以及多线程并发更新下“每个 revision 恰有一个胜者、无丢失更新”；双版本判定预览覆盖 exists/value 的 JSON 类型敏感比较（`1` 与 `true`、`"1"` 与 `1`、整数与浮点）、仅 reason/rule_id 不同算 unchanged、缺失侧 `flag_not_found`、两版本都缺失算 unchanged、明细按“样本在外开关在内”的请求顺序、重复开关位置独立计数、user_id 注入分流、判定器在版本×样本内共享分组而不跨样本泄漏，以及 HTTP 层的重复 subject_id/样本超 200/开关超 50 返回 422、版本不存在返回 404 且无部分结果、校验先于版本查询、重复开关名放行。
 
 ## 项目结构
 
@@ -379,8 +446,9 @@ app/
   validation.py  发布时语义校验（循环依赖/比例/操作符/分组引用与分组循环）
   evaluator.py   纯函数判定引擎（前置、分组递归求值与请求内复用、规则、稳定哈希分流）
   comparison.py  版本对比与反向依赖影响分析（纯函数）
-tests/           标准库 unittest 测试
-examples/        发布/判定/受众分组/版本对比/环境指针/非法配置示例
+  evaluation_preview.py  双版本“样本×开关”判定预览（纯函数，版本×样本级判定器作用域）
+tests/           标准库 unittest 测试（预览端点的 HTTP 用例在装有 fastapi/httpx 时自动启用）
+examples/        发布/判定/受众分组/版本对比/判定预览/环境指针/非法配置示例
 Dockerfile, docker-compose.yml
 ```
 

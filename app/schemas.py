@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic_core import PydanticCustomError
 
 # ---------------------------------------------------------------------------
 # Configuration upload models
@@ -201,3 +202,69 @@ class EnvironmentEvalResponse(BaseModel):
     context: dict[str, Any]
     results: list[EvalResult]
     missing_flags: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Two-version evaluation preview models
+# ---------------------------------------------------------------------------
+
+
+class PreviewSubject(StrictModel):
+    # ``subject_id`` identifies the row in the preview output (unique within
+    # one request); ``user_id`` drives stable percentage rollouts.
+    subject_id: str = Field(min_length=1)
+    user_id: Optional[Any] = None
+    attributes: dict[str, Any] = Field(default_factory=dict)
+
+
+class EvaluationPreviewRequest(StrictModel):
+    from_version: str = Field(min_length=1)
+    to_version: str = Field(min_length=1)
+    flags: list[str] = Field(min_length=1, max_length=50)
+    subjects: list[PreviewSubject] = Field(min_length=1, max_length=200)
+
+    @model_validator(mode="after")
+    def _subject_ids_must_be_unique(self) -> "EvaluationPreviewRequest":
+        seen: set[str] = set()
+        duplicates: list[str] = []
+        for subject in self.subjects:
+            if subject.subject_id in seen and subject.subject_id not in duplicates:
+                duplicates.append(subject.subject_id)
+            seen.add(subject.subject_id)
+        if duplicates:
+            raise PydanticCustomError(
+                "duplicate_subject_id",
+                "subject_id values must be unique within one request; "
+                "duplicates: {duplicates}",
+                {"duplicates": duplicates},
+            )
+        return self
+
+
+class PreviewSide(BaseModel):
+    exists: bool
+    value: Any = None
+    reason: str
+    rule_id: Optional[str] = None
+
+
+class PreviewChangedItem(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    subject_id: str
+    flag: str
+    from_: PreviewSide = Field(alias="from")
+    to: PreviewSide
+
+
+class PreviewFlagSummary(BaseModel):
+    flag: str
+    changed: int
+    unchanged: int
+
+
+class EvaluationPreviewResponse(BaseModel):
+    from_version: str
+    to_version: str
+    changed: list[PreviewChangedItem]
+    summary: list[PreviewFlagSummary]

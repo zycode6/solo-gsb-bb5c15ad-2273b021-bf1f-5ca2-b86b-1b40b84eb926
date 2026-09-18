@@ -13,6 +13,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import db as db_mod
 from .comparison import compare_versions
+from .evaluation_preview import preview_evaluations
 from .evaluator import FlagEvaluator, FlagNotFound
 from .schemas import (
     BatchEvalRequest,
@@ -24,6 +25,8 @@ from .schemas import (
     EnvironmentEvalResponse,
     EnvironmentResponse,
     EnvironmentUpsertRequest,
+    EvaluationPreviewRequest,
+    EvaluationPreviewResponse,
     PublishConfigRequest,
     PublishResponse,
     VersionInfo,
@@ -184,6 +187,54 @@ def compare_configs(body: ConfigComparisonRequest) -> Any:
         from_version=body.from_version,
         to_version=body.to_version,
         **analysis,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Two-version evaluation preview (subject x flag change matrix)
+# ---------------------------------------------------------------------------
+
+
+@app.post(
+    "/api/v1/evaluation-previews",
+    response_model=EvaluationPreviewResponse,
+)
+def preview_comparison(body: EvaluationPreviewRequest) -> Any:
+    # Resolve both versions before evaluating anything, so a missing version
+    # is a clean 404 with no partial results.
+    conn = db_mod.connect()
+    try:
+        from_row = db_mod.get_version(conn, body.from_version)
+        if from_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "version_not_found",
+                    "message": f"config version {body.from_version!r} not found",
+                },
+            )
+        to_row = db_mod.get_version(conn, body.to_version)
+        if to_row is None:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "version_not_found",
+                    "message": f"config version {body.to_version!r} not found",
+                },
+            )
+    finally:
+        conn.close()
+
+    preview = preview_evaluations(
+        from_row["config"],
+        to_row["config"],
+        body.flags,
+        [subject.model_dump() for subject in body.subjects],
+    )
+    return EvaluationPreviewResponse(
+        from_version=body.from_version,
+        to_version=body.to_version,
+        **preview,
     )
 
 
@@ -375,6 +426,7 @@ def root() -> dict[str, Any]:
             "GET /api/v1/configs",
             "GET /api/v1/configs/{version}",
             "POST /api/v1/config-comparisons",
+            "POST /api/v1/evaluation-previews",
             "PUT /api/v1/environments/{name}",
             "GET /api/v1/environments/{name}",
             "POST /api/v1/environments/{name}/evaluate",
